@@ -21,10 +21,7 @@ from parameterized import parameterized
 
 from transformers import DataCollatorWithFlattening, is_torch_available
 from transformers.testing_utils import (
-    require_causal_conv1d,
-    require_flash_linear_attention,
     require_torch,
-    require_torch_gpu,
     torch_device,
 )
 
@@ -149,10 +146,7 @@ class Qwen3_5MoeTextModelTest(CausalLMModelTest, unittest.TestCase):
     def test_reverse_loading_mapping(self, check_keys_were_modified=True):
         pass
 
-    @require_causal_conv1d
-    @require_flash_linear_attention
-    @require_torch_gpu
-    def test_padding_free_matches_padded_fast_path_regression(self):
+    def test_padding_free_matches_padded(self):
         torch.manual_seed(0)
         config = self.model_tester.get_config()
         model = Qwen3_5MoeForCausalLM(config).to(torch_device).eval()

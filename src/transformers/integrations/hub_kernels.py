@@ -1017,6 +1017,9 @@ def use_kernel_func_from_hub_with_fallback(func_name: str, package: str, interna
         applicable_params = tuple(inspect.signature(implementation).parameters)
         # A boolean to track if the implementation is new, i.e. not the original torch function
         is_new_implementation = implementation is not torch_function
+        # The torch functions keep the signature of their hub kernel and read optional arguments, such as packed
+        # sequence boundaries, from `**kwargs`, so these must not be filtered out
+        filter_kwargs = is_new_implementation or "kwargs" not in applicable_params
 
         @functools.wraps(torch_function)
         def wrapped(*args, **kwargs):
@@ -1036,7 +1039,8 @@ def use_kernel_func_from_hub_with_fallback(func_name: str, package: str, interna
                     f"`{distribution}` for the optimized kernel."
                 )
 
-            kwargs = {k: v for k, v in kwargs.items() if k in applicable_params}
+            if filter_kwargs:
+                kwargs = {k: v for k, v in kwargs.items() if k in applicable_params}
             return implementation(*args, **kwargs)
 
         return kernel_wrapper_decorator(wrapped)

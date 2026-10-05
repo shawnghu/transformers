@@ -20,10 +20,7 @@ from parameterized import parameterized
 
 from transformers import DataCollatorWithFlattening, is_torch_available
 from transformers.testing_utils import (
-    require_causal_conv1d,
-    require_flash_linear_attention,
     require_torch,
-    require_torch_gpu,
     require_torch_multi_accelerator,
     slow,
     torch_device,
@@ -39,6 +36,7 @@ if is_torch_available():
         Qwen3NextModel,
     )
     from transformers.models.qwen3_next.modeling_qwen3_next import (
+        causal_conv1d_fn,
         torch_chunk_gated_delta_rule,
         torch_recurrent_gated_delta_rule,
     )
@@ -182,10 +180,7 @@ class Qwen3NextModelTest(CausalLMModelTest, unittest.TestCase):
 
         torch.testing.assert_close(under_test_first, ref_first, rtol=1e-4, atol=1e-4)
 
-    @require_causal_conv1d
-    @require_flash_linear_attention
-    @require_torch_gpu
-    def test_padding_free_matches_padded_fast_path_regression(self):
+    def test_padding_free_matches_padded(self):
         torch.manual_seed(0)
         config = self.model_tester.get_config()
         model = Qwen3NextForCausalLM(config).to(torch_device).eval()
@@ -329,6 +324,36 @@ class Qwen3NextModelTest(CausalLMModelTest, unittest.TestCase):
         )
         torch.testing.assert_close(chunk_out, recurrent_out, rtol=1e-4, atol=1e-5)
         torch.testing.assert_close(chunk_state, recurrent_state, rtol=1e-4, atol=1e-5)
+
+    # With chunk_size=4: boundaries inside chunks, a length-1 sequence, and boundaries aligned with chunks
+    @parameterized.expand([([5, 1, 7],), ([4, 4, 3],)])
+    def test_gdn_packed_sequences_match_separate_sequences(self, lengths: list[int]):
+        torch.manual_seed(0)
+        total_length, num_heads, k_head_dim, v_head_dim, conv_dim, kernel_size = sum(lengths), 3, 8, 16, 12, 4
+        cu_seqlens = torch.tensor([0] + lengths, device=torch_device).cumsum(0)
+        seq_idx = torch.repeat_interleave(
+            torch.arange(len(lengths), device=torch_device), torch.tensor(lengths, device=torch_device)
+        )
+        seq_idx = seq_idx[None].to(torch.int32)
+        conv_input = torch.randn(1, total_length, conv_dim, device=torch_device).transpose(1, 2)  # channels last
+        conv_weight = torch.randn(conv_dim, kernel_size, device=torch_device)
+        query = torch.randn(1, total_length, num_heads, k_head_dim, device=torch_device)
+        key = torch.randn(1, total_length, num_heads, k_head_dim, device=torch_device)
+        value = torch.randn(1, total_length, num_heads, v_head_dim, device=torch_device)
+        g = -torch.rand(1, total_length, num_heads, device=torch_device)
+        beta = torch.rand(1, total_length, num_heads, device=torch_device)
+
+        packed_conv = causal_conv1d_fn(conv_input, conv_weight, activation="silu", seq_idx=seq_idx)
+        packed_out, _ = torch_chunk_gated_delta_rule(
+            query, key, value, g, beta, chunk_size=4, use_qk_l2norm_in_kernel=True, cu_seqlens=cu_seqlens
+        )
+        for start, end in zip(cu_seqlens[:-1].tolist(), cu_seqlens[1:].tolist()):
+            conv = causal_conv1d_fn(conv_input[..., start:end].contiguous(), conv_weight, activation="silu")
+            out, _ = torch_chunk_gated_delta_rule(
+                *(x[:, start:end] for x in (query, key, value, g, beta)), chunk_size=4, use_qk_l2norm_in_kernel=True
+            )
+            torch.testing.assert_close(packed_conv[..., start:end], conv, rtol=1e-4, atol=1e-5)
+            torch.testing.assert_close(packed_out[:, start:end], out, rtol=1e-4, atol=1e-5)
 
 
 @slow

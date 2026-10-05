@@ -269,15 +269,30 @@ def causal_conv1d_fn(
     **kwargs,
 ):
     _, hidden_size, seq_len = hidden_states.shape
-    padding = weight.shape[-1] - 1
+    kernel_size = weight.shape[-1]
+    seq_idx = kwargs.get("seq_idx")
+    hidden_states_conv = hidden_states.to(weight.dtype)
 
-    out = F.conv1d(
-        hidden_states.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=bias,
-        padding=padding,
-        groups=hidden_size,
-    )[:, :, :seq_len]
+    if seq_idx is None:
+        out = F.conv1d(
+            hidden_states_conv,
+            weight=weight.unsqueeze(1),
+            bias=bias,
+            padding=kernel_size - 1,
+            groups=hidden_size,
+        )[:, :, :seq_len]
+    else:
+        # Packed sequences: a token must not look back past the start of its own sequence, so each tap of the
+        # convolution only sees the shifted inputs that share the token's `seq_idx` (accumulated in fp32 like `F.conv1d`)
+        hidden_states_conv, weight_fp32 = hidden_states_conv.float(), weight.float()
+        out = hidden_states_conv * weight_fp32[:, -1:]
+        for shift in range(1, min(kernel_size, seq_len)):
+            same_sequence = (seq_idx[:, shift:] == seq_idx[:, :-shift]).unsqueeze(1)
+            shifted = hidden_states_conv[:, :, :-shift] * same_sequence * weight_fp32[:, -1 - shift, None]
+            out = out + F.pad(shifted, (shift, 0))
+        if bias is not None:
+            out = out + bias[:, None].float()
+        out = out.to(weight.dtype)
     if activation is not None:
         out = ACT2FN[activation](out)
     return out.to(hidden_states.dtype)
@@ -317,12 +332,21 @@ def torch_chunk_gated_delta_rule(
         initial_state: The recurrent state, an optional tensor of shape [batch_size, num_v_heads, k_head_dim, v_head_dim]
         output_final_state: Whether to output the new recurrent state along with the output.
         use_qk_l2norm_in_kernel: If this flag is set to True, query and key vectors are L2-normalized.
+        cu_seqlens (in kwargs): Cumulative lengths of the sequences packed along the sequence dimension (batch_size
+            must be 1), of shape [num_sequences + 1]. The recurrent state is reset at every sequence boundary, and the
+            returned recurrent state is the one of the last sequence.
     Returns:
         - The output tensor of shape [batch_size, sequence_length, num_v_heads, v_head_dim]
         - Either None or the new recurrent state tensor of shape [batch_size, num_v_heads, k_head_dim, v_head_dim]
     """
     initial_dtype = query.dtype
     batch_size, sequence_length, _, k_head_dim = key.shape
+    cu_seqlens = kwargs.get("cu_seqlens")
+    if cu_seqlens is not None and (batch_size != 1 or initial_state is not None):
+        raise ValueError(
+            "The torch implementation of `chunk_gated_delta_rule` only supports `cu_seqlens` with a batch size of 1 and "
+            "no `initial_state`. Install `flash-linear-attention` for the general case."
+        )
     num_v_heads, v_head_dim = value.shape[-2:]
     recurrent_state_shape = (batch_size, num_v_heads, k_head_dim, v_head_dim)
     padded_output_shape = (batch_size, num_v_heads, -1, v_head_dim)  # -1 is the padded sequence length
@@ -363,6 +387,17 @@ def torch_chunk_gated_delta_rule(
     # Create a chunk-sized strictly upper triangular mask, ie. the mask of what a causal chunk may not attend to
     strictly_upper_mask = torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device).triu(1)
 
+    if cu_seqlens is not None:
+        # Index of the packed sequence of each position (the padding joins the last sequence), chunked like the inputs
+        positions = torch.arange(total_sequence_length, device=query.device).clamp(max=sequence_length - 1)
+        seq_idx = torch.searchsorted(cu_seqlens[1:-1].to(query.device), positions, right=True)
+        seq_idx = seq_idx.reshape(num_chunks, chunk_size)
+        # Tokens may not attend to other sequences, only tokens whose sequence started before the chunk read the
+        # carried recurrent state, and only tokens of the last sequence of a chunk write to it
+        strictly_upper_mask = strictly_upper_mask | (seq_idx.unsqueeze(-1) != seq_idx.unsqueeze(-2))
+        reads_state = seq_idx == torch.cat([seq_idx[:1, :1], seq_idx[:-1, -1:]])
+        writes_state = seq_idx == seq_idx[:, -1:]
+
     # Cumulative decay within each chunk (dim 3 is the position inside the chunk). Since decay is in log space,
     # cum_decay[..., t] is the log of a product of decays between the start of the chunk and position t
     cum_decay = decay.cumsum(dim=3)
@@ -378,6 +413,8 @@ def torch_chunk_gated_delta_rule(
     ut_system = (k_beta @ key.transpose(-1, -2)) * pairwise_decay
     intra_chunk_attn = (query @ key.transpose(-1, -2)) * pairwise_decay
     decayed_k_beta = k_beta * cum_decay.exp().unsqueeze(-1)
+    if cu_seqlens is not None:
+        decayed_k_beta = decayed_k_beta * reads_state.unsqueeze(-1)
 
     # Gated delta attention uses a UT transform to condense several delta rule updates into a few matmuls. After the UT
     # system is solved, we can then compute the new_values (called "u" in the DeltaNet paper) and the decayed keys
@@ -407,6 +444,10 @@ def torch_chunk_gated_delta_rule(
     query = query * cum_decay.exp().unsqueeze(-1)
     key = key * (cum_decay[..., -1:] - cum_decay).exp().unsqueeze(-1)
     chunk_decay = cum_decay[..., -1].exp()[..., None, None]
+    if cu_seqlens is not None:
+        query = query * reads_state.unsqueeze(-1)
+        key = key * writes_state.unsqueeze(-1)
+        chunk_decay = chunk_decay * reads_state[:, -1, None, None]
 
     # Second phase: the sequential scan over chunks
     for i in range(num_chunks):

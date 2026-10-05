@@ -374,15 +374,30 @@ def causal_conv1d_fn(
     **kwargs,
 ):
     _, hidden_size, seq_len = hidden_states.shape
-    padding = weight.shape[-1] - 1
+    kernel_size = weight.shape[-1]
+    seq_idx = kwargs.get("seq_idx")
+    hidden_states_conv = hidden_states.to(weight.dtype)
 
-    out = F.conv1d(
-        hidden_states.to(weight.dtype),
-        weight=weight.unsqueeze(1),
-        bias=bias,
-        padding=padding,
-        groups=hidden_size,
-    )[:, :, :seq_len]
+    if seq_idx is None:
+        out = F.conv1d(
+            hidden_states_conv,
+            weight=weight.unsqueeze(1),
+            bias=bias,
+            padding=kernel_size - 1,
+            groups=hidden_size,
+        )[:, :, :seq_len]
+    else:
+        # Packed sequences: a token must not look back past the start of its own sequence, so each tap of the
+        # convolution only sees the shifted inputs that share the token's `seq_idx` (accumulated in fp32 like `F.conv1d`)
+        hidden_states_conv, weight_fp32 = hidden_states_conv.float(), weight.float()
+        out = hidden_states_conv * weight_fp32[:, -1:]
+        for shift in range(1, min(kernel_size, seq_len)):
+            same_sequence = (seq_idx[:, shift:] == seq_idx[:, :-shift]).unsqueeze(1)
+            shifted = hidden_states_conv[:, :, :-shift] * same_sequence * weight_fp32[:, -1 - shift, None]
+            out = out + F.pad(shifted, (shift, 0))
+        if bias is not None:
+            out = out + bias[:, None].float()
+        out = out.to(weight.dtype)
     if activation is not None:
         out = ACT2FN[activation](out)
     return out.to(hidden_states.dtype)
